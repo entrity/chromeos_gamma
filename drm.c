@@ -16,72 +16,145 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
+#define DEBUG_STR "debug"
 #define SAVE_ORIG "bak"
 #define SAVE_FILE "save"
 #define LOAD_FILE "load"
-#define DIVIDE_2 "/2"
-#define MULTIP_2 "x2"
+#define DIVIDE_2 "divide"
+#define MULTIP_2 "mult"
 #define ORIG_GAMMA_FILE "orig_gamma_table.dat"
 
-struct gamma_table {
-   uint16_t *r, *g, *b;
+#define GET_GAMMA(dat) drmModeCrtcGetGamma(dat->fd, dat->crtc_id, dat->crtc->gamma_size, dat->r, dat->g, dat->b)
+#define SET_GAMMA(dat) drmModeCrtcSetGamma(dat->fd, dat->crtc_id, dat->crtc->gamma_size, dat->r, dat->g, dat->b)
+
+struct crtc_data {
+  uint16_t *r, *g, *b; // gammas
+  int fd;
+  uint32_t crtc_id;
+  drmModeCrtc *crtc;
 };
 
-// callback for processing a RGB gamma triplet from any function
-// called by iterate_crtcs
-static void (*gamma_processor)(size_t, uint16_t*, uint16_t*, uint16_t*);
+/*GLOBALS*/
 
-// pointer to data used by gamma_processor function. this is not
-// the gamma data but any supplemental data, such as a file descriptor
-static void *gamma_processor_data;
+char do_debug, do_back, do_multiply, do_divide;
+char *do_save, *do_load;
+int back_fd = -2, save_fd = -2, load_fd = -2;
 
-static void error()
+/*STATIC FUNCTIONS*/
+
+static void error(char * msg)
 {
-  fprintf(stderr, "err %d\n", errno);
+  perror(msg);
   exit(errno || -1);
 }
 
-static void save_table(size_t gamma_size, uint16_t *r, uint16_t *g, uint16_t *b)
+static void save_table(int fd, struct crtc_data *dat)
 {
-  int gamma_out_fd = *((int *) gamma_processor_data);
-  write(gamma_out_fd, r, gamma_size*sizeof(uint16_t));
-  write(gamma_out_fd, g, gamma_size*sizeof(uint16_t));
-  write(gamma_out_fd, b, gamma_size*sizeof(uint16_t));
+  GET_GAMMA(dat);
+  size_t gamma_size = dat->crtc->gamma_size;
+  write(fd, dat->r, gamma_size*sizeof(uint16_t));
+  write(fd, dat->g, gamma_size*sizeof(uint16_t));
+  write(fd, dat->b, gamma_size*sizeof(uint16_t));
   puts("wrote one table\n");
 }
 
-void set_gamma(int fd, uint32_t crtc_id)
+static void load_table(int fd, struct crtc_data *dat)
 {
-  // int r, g, b;
-  // drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
-  // int res = drmModeCrtcSetGamma(fd, crtc_id, crtc->gamma_size, r, g, b);
-  // printf("Attempted to set gamma: %3d\n", res);
+  size_t gamma_size = dat->crtc->gamma_size;
+  read(fd, dat->r, gamma_size*sizeof(uint16_t));
+  read(fd, dat->g, gamma_size*sizeof(uint16_t));
+  read(fd, dat->b, gamma_size*sizeof(uint16_t));
+  puts("read one table\n");
+  SET_GAMMA(dat);
+}
+
+static void debug(struct crtc_data *dat)
+{
+  size_t gamma_size = dat->crtc->gamma_size;
+  GET_GAMMA(dat);
+  for (int gidx = 0; gidx < gamma_size; gidx++) {
+    printf("\t\tgamma(%3d) %5d %5d %5d\n", gidx, dat->r[gidx], dat->g[gidx], dat->b[gidx]);
+  }
+}
+
+static void divide_gamma(struct crtc_data *dat)
+{
+  GET_GAMMA(dat);
+  size_t gamma_size = dat->crtc->gamma_size;
+  for (int i = 0; i < gamma_size; i++) {
+    dat->r[i] = dat->r[i] / 2;
+    dat->g[i] = dat->g[i] / 2;
+    dat->b[i] = dat->b[i] / 2;
+  }
+  // SET_GAMMA(dat);
+  lseek(dat->fd, 0, SEEK_SET);
+  int ret = drmModeCrtcSetGamma(dat->fd, dat->crtc_id, dat->crtc->gamma_size, dat->r, dat->g, dat->b);
+  printf("set gamma after dividing: %d\n", ret);
+}
+
+static void multiply_gamma()
+{
+  
 }
 
 void iterate_crtcs(int fd)
 {
-  uint16_t *r, *g, *b;
+  int save_fd, backup_fd, load_fd;
   drmModeResPtr res = drmModeGetResources(fd);
   printf("crtc ct %15d\n", res->count_crtcs);
-  for (int crtc_idx = 0; crtc_idx < res->count_crtcs; crtc_idx++) {
-    uint32_t crtc_id = res->crtcs[crtc_idx];
-    drmModeCrtc *crtc = drmModeGetCrtc(fd, crtc_id);
-    printf("\tcrtc id? %15d\t%3d\n", crtc_id, crtc->gamma_size);
-    
-    r = calloc(crtc->gamma_size, sizeof(uint16_t));
-    g = calloc(crtc->gamma_size, sizeof(uint16_t));
-    b = calloc(crtc->gamma_size, sizeof(uint16_t));
-    drmModeCrtcGetGamma(fd, crtc_id, crtc->gamma_size, r, g, b);
-    
-    // for (int gidx = 0; gidx < crtc->gamma_size; gidx++) {
-    //   printf("\t\tgamma(%3d) %5d %5d %5d\n", gidx, r[gidx], g[gidx], b[gidx]);
-    // }
-    gamma_processor(crtc->gamma_size, r, g, b);
-    
-    free(r); free(g); free(b);
-    printf("crtc gotten\n");
+  
+  // allocate/init crtc_data
+  struct crtc_data *dat = (struct crtc_data *) malloc(sizeof(struct crtc_data));
+  dat->fd = fd;
+  
+  // open files as necessary
+  if (do_back) {
+    printf(ORIG_GAMMA_FILE "\n");
+    back_fd = open(ORIG_GAMMA_FILE, O_WRONLY | O_CREAT);
+    if (back_fd < 0) error("open backup file");
+  }
+  if (do_save) {
+    save_fd = open(do_save, O_WRONLY | O_CREAT);
+    if (save_fd < 0) error("open save file");
+  }
+  if (do_load) {
+    load_fd = open(do_load, O_RDONLY);
+    if (load_fd < 0) error("open load file");
   }
   
+  // Iterate through crtcs for this fd
+  for (int crtc_idx = 0; crtc_idx < res->count_crtcs; crtc_idx++) {
+    dat->crtc_id = res->crtcs[crtc_idx];
+    dat->crtc = drmModeGetCrtc(fd, dat->crtc_id);
+    dat->r = calloc(dat->crtc->gamma_size, sizeof(uint16_t));
+    dat->g = calloc(dat->crtc->gamma_size, sizeof(uint16_t));
+    dat->b = calloc(dat->crtc->gamma_size, sizeof(uint16_t));
+    printf("\tcrtc id? %15d\t%3d\n", dat->crtc_id, dat->crtc->gamma_size);
+    
+    // Process gamma as desired
+    if (do_debug)
+      debug(dat);
+    if (do_back)
+      save_table(back_fd, dat);
+    if (do_save)
+      save_table(save_fd, dat);
+    if (do_load)
+      load_table(load_fd, dat);
+    if (do_divide)
+      divide_gamma(dat);
+    if (do_multiply)
+      multiply_gamma(dat);
+    
+    printf("crtc gotten\n");
+    free(dat->r); free(dat->g); free(dat->b);
+  }
+  
+  // close files as necessary
+  if (do_back) close(backup_fd);
+  if (do_save) close(save_fd);
+  if (do_load) close(load_fd);
+  // cleanup
+  free(dat);
 }
 
 void iterate_fds()
@@ -117,47 +190,17 @@ void iterate_fds()
   }
 }
 
-static void save_file(char *filepath)
-{
-  int gamma_out_fd = open(filepath, O_WRONLY | O_CREAT);
-  if (gamma_out_fd < 0) error();
-  printf("Opened file %d %s\n", gamma_out_fd, filepath);
-  gamma_processor = save_table;
-  gamma_processor_data = &gamma_out_fd;
-  iterate_fds();
-  close(gamma_out_fd);
-}
-
-static void load_file(char *filepath)
-{
-  
-}
-
-static void divide_gamma_by_2()
-{
-  
-}
-
-static void multiply_gamma_by_2()
-{
-  
-}
-
 int main(int argn, char *argc[])
 {
   for (int i = 1; i < argn; i++) {
     printf("arg %2d\t%s\n", i, argc[i]);
-    if (!strcmp(argc[i], SAVE_ORIG))
-      save_file(ORIG_GAMMA_FILE);
-    if (!strcmp(argc[i], SAVE_FILE))
-      save_file(argc[++i]);
-    if (!strcmp(argc[i], LOAD_FILE))
-      load_file(argc[++i]);
-    if (!strcmp(argc[i], DIVIDE_2))
-      divide_gamma_by_2();
-    if (!strcmp(argc[i], MULTIP_2))
-      multiply_gamma_by_2();
+    if (!strcmp(argc[i], DEBUG_STR)) do_debug = 1;
+    if (!strcmp(argc[i], SAVE_ORIG)) do_back = 1;
+    if (!strcmp(argc[i], SAVE_FILE)) do_save = argc[++i];
+    if (!strcmp(argc[i], LOAD_FILE)) do_load = argc[++i];
+    if (!strcmp(argc[i], DIVIDE_2))  do_divide = 1;
+    if (!strcmp(argc[i], MULTIP_2))  do_multiply = 1;
   }
-  // org_connectors();
+  iterate_fds();
   return 0;
 }
